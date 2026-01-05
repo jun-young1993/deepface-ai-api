@@ -1,0 +1,26 @@
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# 가상환경
+babylog/
+venv/
+env/
+ENV/
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# 테스트 및 가상환경
+/tests
+/deepface
+
