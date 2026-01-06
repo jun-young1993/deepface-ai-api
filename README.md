@@ -23,27 +23,50 @@ docker build -t deep-face-ai .
 ```
 
 2. Docker 컨테이너 실행:
+
+**방법 A: Foreground 모드 (모든 출력을 실시간으로 확인)**
 ```bash
-docker run -d --name deep-face-ai -p 8080:8080 deep-face-ai
+docker run --name deep-face-ai -p 8080:8080 gcr.io/ai-hub-483500/deep-face-ai-api:v1.1
 ```
+- 모든 로그가 실시간으로 출력됩니다
+- 컨테이너를 중지하려면 `Ctrl+C`를 누르세요
+
+**방법 B: Background 모드 (백그라운드에서 실행)**
+```bash
+docker run -d --name deep-face-ai -p 8080:8080 deep-face-ai-api:latest
+```
+- 백그라운드에서 실행됩니다
+- 로그를 보려면 아래 명령어를 사용하세요
 
 3. 서버 확인:
 - API 문서: http://localhost:8080/docs
 - 헬스체크: http://localhost:8080/health
 
+
+도커 쉘 오픈
+```bash
+docker exec -it deep-face-ai sh
+```
+
 **컨테이너 관리:**
 ```bash
-# 로그 확인
+# 로그 확인 (실시간 출력)
 docker logs -f deep-face-ai
+
+# 로그 확인 (마지막 100줄)
+docker logs --tail 100 deep-face-ai
 
 # 컨테이너 중지
 docker stop deep-face-ai
+
+# 컨테이너 재시작
+docker start deep-face-ai
 
 # 컨테이너 삭제
 docker rm deep-face-ai
 
 # 이미지 삭제
-docker rmi deep-face-ai
+docker rmi deep-face-ai-api:latest
 ```
 
 ### 방법 2: 로컬 실행 (가상환경 사용)
@@ -86,6 +109,8 @@ python -m uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 ```bash
 deepface/Scripts/python.exe -m uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 ```
+
+
 
 **3단계: 서버 확인**
 

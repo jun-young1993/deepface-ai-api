@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import glob
 import uuid
+import shutil
 from typing import Any, Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -14,6 +15,9 @@ from pydantic import BaseModel, Field
 
 # TensorFlow oneDNN 관련 로그를 줄이고 싶다면 0으로 설정 (원하면 삭제해도 됨)
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+
+# Docker WORKDIR 기준 경로 (모든 파일 작업은 이 경로 기준으로 수행)
+WORK_DIR = os.environ.get("WORK_DIR", "/app")
 
 app = FastAPI(title="DeepFace API", version="0.1.0")
 
@@ -50,14 +54,18 @@ class FindRequest(BaseModel):
     db_path: str | None = None
     model_name: str | None = None
     distance_metric: str | None = None
-    enforce_detection: bool = True
+    enforce_detection: bool = False  # 기본값 False: 얼굴 검출 실패해도 빈 결과 반환
     detector_backend: str | None = None
     dedupe_identity: bool = True  # 같은 identity면 confidence 가장 높은 1개만 남김
 
 
 class SaveTempFileResponse(BaseModel):
     saved_path: str
-    expires_in_seconds: int
+
+
+class SaveTempFilesResponse(BaseModel):
+    files: list[SaveTempFileResponse]
+    total: int
 
 
 @app.get("/health")
@@ -65,12 +73,46 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def _normalize_path(path: str) -> str:
+    """
+    경로를 정규화합니다. Windows와 Unix 경로를 모두 처리합니다.
+    모든 경로는 WORK_DIR(/app) 기준으로 처리됩니다.
+    files/temp/raw에서 반환된 경로를 그대로 사용할 수 있도록 보장합니다.
+    """
+    if not path:
+        return path
+    
+    # 절대 경로인 경우 그대로 사용 (이미 /app 기준일 수 있음)
+    if os.path.isabs(path):
+        normalized = os.path.normpath(path)
+        # /app 밖의 경로는 /app 기준으로 변환
+        if not normalized.startswith(WORK_DIR):
+            # 절대 경로지만 /app 밖이면 상대 경로로 간주하고 /app 기준으로 변환
+            normalized = os.path.join(WORK_DIR, normalized.lstrip("/"))
+            normalized = os.path.normpath(normalized)
+    else:
+        # 상대 경로는 WORK_DIR 기준으로 변환
+        normalized = os.path.join(WORK_DIR, path)
+        normalized = os.path.normpath(normalized)
+    
+    return normalized
+
+
 def _ensure_exists(path: str, is_dir: bool = False) -> None:
-    if not os.path.exists(path):
-        raise HTTPException(status_code=400, detail=f"Path not found: {path}")
-    if is_dir and not os.path.isdir(path):
+    """
+    경로가 존재하는지 확인합니다. 모든 경로는 WORK_DIR(/app) 기준으로 처리됩니다.
+    """
+    normalized_path = _normalize_path(path)
+    if not os.path.exists(normalized_path):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Path not found: {normalized_path} (original: {path}). "
+                   f"All paths must be relative to {WORK_DIR}. "
+                   f"If this path was returned from /files/temp, ensure the file was saved successfully."
+        )
+    if is_dir and not os.path.isdir(normalized_path):
         raise HTTPException(status_code=400, detail=f"Path is not a directory: {path}")
-    if not is_dir and not os.path.isfile(path):
+    if not is_dir and not os.path.isfile(normalized_path):
         raise HTTPException(status_code=400, detail=f"Path is not a file: {path}")
 
 
@@ -80,112 +122,95 @@ def _to_deepface_kwargs(model: BaseModel) -> dict[str, Any]:
 
 
 def _safe_makedirs(dir_path: str) -> None:
-    # 필요한 경우 폴더 생성
-    os.makedirs(dir_path, exist_ok=True)
+    """
+    WORK_DIR(/app) 기준으로 폴더를 생성합니다.
+    """
+    normalized_path = _normalize_path(dir_path)
+    os.makedirs(normalized_path, exist_ok=True)
 
 
 def _delete_file_safely(path: str) -> None:
+    """파일을 안전하게 삭제합니다."""
     try:
-        if os.path.exists(path):
+        if os.path.exists(path) and os.path.isfile(path):
             os.remove(path)
     except Exception:
-        # 임시 파일 삭제 실패는 무시
+        # 파일 삭제 실패는 무시
         pass
 
 
-@app.post("/files/temp", response_model=SaveTempFileResponse)
+def _delete_directory_safely(dir_path: str) -> None:
+    """디렉토리 내의 모든 파일을 안전하게 삭제합니다."""
+    try:
+        if os.path.exists(dir_path) and os.path.isdir(dir_path):
+            for root, dirs, files in os.walk(dir_path):
+                for file in files:
+                    try:
+                        os.remove(os.path.join(root, file))
+                    except Exception:
+                        pass
+                for dir_name in dirs:
+                    try:
+                        shutil.rmtree(os.path.join(root, dir_name))
+                    except Exception:
+                        pass
+    except Exception:
+        # 디렉토리 삭제 실패는 무시
+        pass
+
+
+@app.post("/files/temp", response_model=SaveTempFilesResponse)
 async def save_temp_file(
     dir_path: str = Form(...),
-    file: UploadFile = File(...),
-    ttl_seconds: int = Form(600),
-) -> SaveTempFileResponse:
+    files: list[UploadFile] = File(...),
+) -> SaveTempFilesResponse:
     """
-    dir_path를 받으면 폴더를 만들고, 업로드 파일을 해당 폴더에 '임시'로 저장합니다.
-    ttl_seconds 후에 백그라운드로 삭제를 시도합니다.
+    dir_path를 받으면 폴더를 만들고, 업로드 파일들을 해당 폴더에 저장합니다.
+    여러 파일을 한 번에 업로드할 수 있습니다.
+    모든 경로는 /app 기준으로 처리됩니다.
+    파일 정리는 사용자가 직접 관리합니다.
     """
-    if ttl_seconds < 0 or ttl_seconds > 60 * 60 * 24:
-        raise HTTPException(status_code=400, detail="ttl_seconds must be between 0 and 86400.")
+    if not files:
+        raise HTTPException(status_code=400, detail="At least one file is required.")
 
-    _safe_makedirs(dir_path)
+    # dir_path를 /app 기준으로 정규화
+    normalized_dir_path = _normalize_path(dir_path)
+    _safe_makedirs(normalized_dir_path)
 
-    original = file.filename or "upload"
-    _, ext = os.path.splitext(original)
-    name = f"{uuid.uuid4().hex}{ext}"
-    saved_path = os.path.join(dir_path, name)
+    saved_files: list[SaveTempFileResponse] = []
+    errors: list[str] = []
 
-    # 저장
-    try:
-        content = await file.read()
-        with open(saved_path, "wb") as f:
-            f.write(content)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save file: {e}") from e
+    for file in files:
+        original = file.filename or "upload"
+        _, ext = os.path.splitext(original)
+        name = f"{original}"
+        saved_path = os.path.join(normalized_dir_path, name)
 
-    # 임시 삭제: ttl_seconds == 0이면 즉시 삭제
-    if ttl_seconds == 0:
-        _delete_file_safely(saved_path)
-
-    return SaveTempFileResponse(saved_path=saved_path, expires_in_seconds=ttl_seconds)
-
-
-async def _save_raw_body_to_path(request: Request, dest_path: str) -> int:
-    """
-    Save request body (raw bytes) to dest_path using streaming.
-    Returns total bytes written.
-    """
-    total = 0
-    with open(dest_path, "wb") as f:
-        async for chunk in request.stream():
-            if not chunk:
-                continue
-            f.write(chunk)
-            total += len(chunk)
-    return total
-
-
-@app.post("/files/temp/raw", response_model=SaveTempFileResponse)
-async def save_temp_file_raw(
-    request: Request,
-    dir_path: str,
-    filename: str | None = None,
-    ttl_seconds: int = 600,
-) -> SaveTempFileResponse:
-    """
-    raw 바이너리(application/octet-stream)를 바디로 받아서,
-    dir_path 폴더를 만들고 임시 파일로 저장합니다.
-
-    호출 예:
-      curl -X POST "http://127.0.0.1:8000/files/temp/raw?dir_path=C:/tmp&filename=a.jpg" \
-        -H "Content-Type: application/octet-stream" \
-        --data-binary "@C:/path/to/local.jpg"
-    """
-    if ttl_seconds < 0 or ttl_seconds > 60 * 60 * 24:
-        raise HTTPException(status_code=400, detail="ttl_seconds must be between 0 and 86400.")
-
-    _safe_makedirs(dir_path)
-
-    ext = ""
-    if filename:
-        _, ext = os.path.splitext(filename)
-    name = f"{uuid.uuid4().hex}{ext}"
-    saved_path = os.path.join(dir_path, name)
-
-    try:
-        written = await _save_raw_body_to_path(request, saved_path)
-        if written == 0:
+        # 저장
+        try:
+            content = await file.read()
+            with open(saved_path, "wb") as f:
+                f.write(content)
+            
+            # 반환되는 경로를 정규화하여 find, verify, analyze API에서 바로 사용할 수 있도록 보장
+            normalized_saved_path = _normalize_path(saved_path)
+            saved_files.append(SaveTempFileResponse(
+                saved_path=normalized_saved_path
+            ))
+        except Exception as e:
+            errors.append(f"Failed to save {file.filename}: {str(e)}")
             _delete_file_safely(saved_path)
-            raise HTTPException(status_code=400, detail="Request body is empty.")
-    except HTTPException:
-        raise
-    except Exception as e:
-        _delete_file_safely(saved_path)
-        raise HTTPException(status_code=500, detail=f"Failed to save raw body: {e}") from e
 
-    # ttl_seconds == 0이면 즉시 삭제
-    if ttl_seconds == 0:
-        _delete_file_safely(saved_path)
+    if not saved_files and errors:
+        raise HTTPException(status_code=500, detail=f"All files failed to save: {'; '.join(errors)}")
 
-    return SaveTempFileResponse(saved_path=saved_path, expires_in_seconds=ttl_seconds)
+    return SaveTempFilesResponse(files=saved_files, total=len(saved_files))
+
+
+
+
+
+
 
 def _json_safe(data: Any) -> Any:
     """
@@ -270,14 +295,27 @@ async def verify(req: VerifyRequest) -> Any:
             status_code=400,
             detail="img1_path and img2_path are required.",
         )
-    _ensure_exists(req.img1_path)
-    _ensure_exists(req.img2_path)
+    
+    # files/temp/raw에서 반환된 경로를 정규화하여 사용
+    img1_path = _normalize_path(req.img1_path)
+    img2_path = _normalize_path(req.img2_path)
+    
+    _ensure_exists(img1_path)
+    _ensure_exists(img2_path)
 
     kwargs = _to_deepface_kwargs(req)
+    # 정규화된 경로로 교체
+    kwargs['img1_path'] = img1_path
+    kwargs['img2_path'] = img2_path
     try:
         from deepface import DeepFace
 
         result = await run_in_threadpool(DeepFace.verify, **kwargs)
+        
+        # 결과 반환 전에 요청 파일과 비교 파일 삭제
+        _delete_file_safely(img1_path)
+        _delete_file_safely(img2_path)
+        
         return JSONResponse(content=_json_safe(result))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -289,25 +327,34 @@ async def find(req: FindRequest) -> Any:
             status_code=400,
             detail="img_path and db_path are required.",
         )
-    _ensure_exists(req.img_path, is_dir=False)
-    _ensure_exists(req.db_path, is_dir=True)
+    
+    # files/temp/raw에서 반환된 경로를 정규화하여 사용
+    img_path = _normalize_path(req.img_path)
+    db_path = _normalize_path(req.db_path)
+    
+    _ensure_exists(img_path, is_dir=False)
+    _ensure_exists(db_path, is_dir=True)
 
-    # Check if db_path contains image files
+    # Check if db_path contains image files (정규화된 경로 사용)
     image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.gif']
     image_files = []
     for ext in image_extensions:
-        image_files.extend(glob.glob(os.path.join(req.db_path, ext)))
-        image_files.extend(glob.glob(os.path.join(req.db_path, ext.upper())))
+        image_files.extend(glob.glob(os.path.join(db_path, ext)))
+        image_files.extend(glob.glob(os.path.join(db_path, ext.upper())))
     
     if not image_files:
         raise HTTPException(
             status_code=400,
-            detail=f"No image files found in db_path: {req.db_path}. "
-                   f"Please ensure the directory contains image files (jpg, jpeg, png, bmp, gif)."
+            detail=f"No image files found in db_path: {db_path} (original: {req.db_path}). "
+                   f"Please ensure the directory contains image files (jpg, jpeg, png, bmp, gif). "
+                   f"All paths are relative to {WORK_DIR}."
         )
 
     kwargs = _to_deepface_kwargs(req)
     dedupe_identity = bool(kwargs.pop("dedupe_identity", True))
+    # 정규화된 경로로 교체
+    kwargs['img_path'] = img_path
+    kwargs['db_path'] = db_path
 
     try:
         from deepface import DeepFace
@@ -337,6 +384,11 @@ async def find(req: FindRequest) -> Any:
         payload = _json_safe(result)
         if dedupe_identity:
             payload = _dedupe_find_payload(payload)
+        
+        # 결과 반환 전에 요청 파일과 db_path 내의 모든 파일 삭제
+        _delete_file_safely(img_path)
+        _delete_directory_safely(db_path)
+        
         return JSONResponse(content=payload)
     except ValueError as e:
         # Handle pandas DataFrame creation errors
@@ -356,9 +408,14 @@ async def analyze(req: AnalyzeRequest) -> Any:
             status_code=400,
             detail="img_path is required.",
         )
-    _ensure_exists(req.img_path)
-
+    
+    # files/temp/raw에서 반환된 경로를 정규화하여 사용
+    img_path = _normalize_path(req.img_path)
+    _ensure_exists(img_path)
+    
     kwargs = _to_deepface_kwargs(req)
+    # 정규화된 경로로 교체
+    kwargs['img_path'] = img_path
     try:
         from deepface import DeepFace
 
